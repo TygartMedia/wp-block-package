@@ -61,8 +61,18 @@ def main():
     scoped = '\n'.join(scope_rules(c, wrap) for c in css_blocks)
 
     links = [l for l in re.findall(r'<link[^>]*>', html) if 'rel="icon"' not in l]
-    body_inner = re.findall(r'<body[^>]*>(.*)</body>', html, re.S)[0]
-    scripts = re.findall(r'(<script[^>]*>.*?</script>)', html, re.S)
+    body_match = re.search(r'<body[^>]*>(.*)</body>', html, re.S)
+    if not body_match:
+        sys.exit('wp-block-package: no <body> found in ' + src)
+    body_inner = body_match.group(1)
+    outside_body = html[:body_match.start(1)] + html[body_match.end(1):]
+    # Scripts outside <body> (e.g. in <head>) get hoisted after the wrapper;
+    # scripts already inside the body stay exactly where they are. This fixes
+    # the old double-emit bug where a body <script> appeared twice in output.
+    scripts = re.findall(r'(<script[^>]*>.*?</script>)', outside_body, re.S)
+    # <style> inside the body is repackaged into the single scoped <style>
+    # block above, so strip it here — same double-emit class of bug.
+    body_inner = re.sub(r'<style[^>]*>.*?</style>', '', body_inner, flags=re.S)
 
     block = ('<!-- wp:html -->\n' + '\n'.join(links)
              + '\n<style>\n' + scoped + '\n</style>\n'
@@ -127,6 +137,8 @@ def main():
     # sanity checks
     assert ':root' not in scoped, 'unscoped :root vars remain'
     assert not re.search(r'<(html|head|body)[\s>]', block), 'stray document tags remain'
+    # script regression guard: every script in the source appears exactly once
+    assert block.count('<script') == html.count('<script'), 'script count mismatch (duplicate or dropped)'
     print(f'wrote {dst} ({len(block)} chars, {len(scoped)} css chars)')
 
 if __name__ == '__main__':
