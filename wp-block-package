@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Package a self-contained HTML article for WordPress Custom HTML block.
+
+Scopes every CSS rule under a wrapper class so bare selectors (body, a, h1,
+table, ...) can't leak out and restyle the site theme. Wraps the body content
+in the wrapper div, keeps font links + scripts, drops head-only tags.
+
+Usage: wp-block-package <input.html> <output.html> [wrapper-class]
+"""
+import re, sys
+
+def scope_selector_list(sel, wrap):
+    parts = [p.strip() for p in sel.split(',')]
+    out = []
+    for p in parts:
+        if p == ':root':
+            out.append('.' + wrap)
+        elif p == 'html':
+            out.append(None)  # dropped
+        elif p == 'body':
+            out.append('.' + wrap)
+        elif p == '*':
+            out.append('.' + wrap + ',.' + wrap + ' *')
+        elif p.startswith('.' + wrap):
+            out.append(p)
+        else:
+            out.append('.' + wrap + ' ' + p)
+    out = [o for o in out if o]
+    return ', '.join(out) if out else None
+
+def scope_rules(css, wrap):
+    out, i, n = [], 0, len(css)
+    while i < n:
+        j = css.find('{', i)
+        if j == -1:
+            out.append(css[i:]); break
+        sel = css[i:j].strip()
+        depth, k = 1, j + 1
+        while k < n and depth:
+            if css[k] == '{': depth += 1
+            elif css[k] == '}': depth -= 1
+            k += 1
+        body = css[j+1:k-1]
+        if sel.startswith('@media'):
+            out.append(sel + '{' + scope_rules(body, wrap) + '}')
+        elif sel.startswith('@'):
+            out.append(sel + '{' + body + '}')
+        else:
+            scoped = scope_selector_list(sel, wrap)
+            if scoped:
+                out.append(scoped + '{' + body + '}')
+        i = k
+    return ''.join(out)
+
+def main():
+    src, dst = sys.argv[1], sys.argv[2]
+    wrap = sys.argv[3] if len(sys.argv) > 3 else 'article-wrap'
+    html = open(src, encoding='utf-8').read()
+
+    css_blocks = re.findall(r'<style[^>]*>(.*?)</style>', html, re.S)
+    scoped = '\n'.join(scope_rules(c, wrap) for c in css_blocks)
+
+    links = [l for l in re.findall(r'<link[^>]*>', html) if 'rel="icon"' not in l]
+    body_inner = re.findall(r'<body[^>]*>(.*)</body>', html, re.S)[0]
+    scripts = re.findall(r'(<script[^>]*>.*?</script>)', html, re.S)
+
+    block = ('<!-- wp:html -->\n' + '\n'.join(links)
+             + '\n<style>\n' + scoped + '\n</style>\n'
+             + '<div class="' + wrap + '">\n' + body_inner.strip() + '\n</div>\n'
+             + '\n'.join(scripts) + '\n<!-- /wp:html -->')
+
+    # Inheritance guard (lesson 2026-09-17, GEO article white-text bug):
+    # the site theme targets bare elements directly (e.g. p{color:#fff} for the
+    # dark theme). A directly-applied declaration beats color inherited from the
+    # wrapper, so any text element the article CSS doesn't color explicitly
+    # renders in the THEME's color. Emit explicit same-specificity guards for
+    # text elements the source CSS leaves unstyled, using the wrapper's own
+    # declared color. Only for elements with no existing rule under the wrapper,
+    # so intentional article styling is never overridden.
+    guard_els = ['p', 'li', 'td', 'th', 'blockquote', 'figcaption', 'footer']
+    wrap_color = None
+    for m in re.finditer(r'\.' + re.escape(wrap) + r'\s*\{([^}]*)\}', scoped):
+        cm = re.search(r'(?<![a-z-])color\s*:\s*([^;]+);', m.group(1))
+        if cm:
+            wrap_color = cm.group(1).strip()
+            break
+    def el_has_prop(el, prop):
+        # True if any rule under the wrapper targets the element AND sets prop
+        for m in re.finditer(r'([^{}]+)\{([^}]*)\}', scoped):
+            sel, body = m.group(1), m.group(2)
+            if '.' + wrap not in sel:
+                continue
+            if re.search(r'(?<![a-z-])' + el + r'(?![a-z-])', sel) and \
+               re.search(r'(?<![a-z-])' + prop + r'\s*:', body):
+                return True
+        return False
+    def el_declared_color(el):
+        # first color declared on any wrapper-scoped rule targeting the element
+        for m in re.finditer(r'([^{}]+)\{([^}]*)\}', scoped):
+            sel, body = m.group(1), m.group(2)
+            if '.' + wrap not in sel:
+                continue
+            if re.search(r'(?<![a-z-])' + el + r'(?![a-z-])', sel):
+                cm = re.search(r'(?<![a-z-])color\s*:\s*([^;]+);', body)
+                if cm:
+                    return cm.group(1).strip()
+        return None
+    if wrap_color:
+        need_color = [e for e in guard_els if not el_has_prop(e, 'color')]
+        guards = ['.%s %s{color:%s}' % (wrap, e, wrap_color) for e in need_color]
+        # footer p needs its own guard: theme p rules hit it directly, beating
+        # color inherited from the footer element. Use the footer's own color.
+        footer_color = el_declared_color('footer') or wrap_color
+        if not el_has_prop('footer p', 'color') and not re.search(
+                r'\.' + re.escape(wrap) + r'[^{]*footer\s+p\s*\{', scoped):
+            guards.append('.%s footer p{color:%s}' % (wrap, footer_color))
+        if not el_has_prop('footer', 'background'):
+            # doubled class + !important: the dark theme's footer rule beat the
+            # plain guard on tygartmedia.com (2026-09-17). Belt and suspenders.
+            guards.append('.%s.%s footer{background-color:transparent!important}' % (wrap, wrap))
+        if guards:
+            guard_css = '\n/* inheritance guard: explicit colors beat theme element rules */\n' + '\n'.join(guards)
+            block = block.replace('</style>', guard_css + '\n</style>', 1)
+            print(f'inheritance guard: {len(guards)} rules for [{", ".join(need_color)}]')
+
+    open(dst, 'w', encoding='utf-8').write(block)
+    # sanity checks
+    assert ':root' not in scoped, 'unscoped :root vars remain'
+    assert not re.search(r'<(html|head|body)[\s>]', block), 'stray document tags remain'
+    print(f'wrote {dst} ({len(block)} chars, {len(scoped)} css chars)')
+
+if __name__ == '__main__':
+    main()
